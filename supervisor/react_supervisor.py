@@ -11,7 +11,10 @@ import logging
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 
-from supervisor.models import SupervisorState, ReasoningStep, TaskRequest, TaskResponse, AgentCall
+from supervisor.models import (
+    SupervisorState, ReasoningStep, TaskRequest, TaskResponse, AgentCall,
+    ExecutionPlan, ExecutionNode, TaskType, TaskStatus
+)
 from supervisor.agent_registry import AgentRegistry
 from core.llm_factory import LLMFactory
 from core.memory import MemoryManager
@@ -188,6 +191,371 @@ For multi-part queries, call different agents for different parts."""
         # If we have multiple task types or connectors, it's likely multi-part
         return len(set(task_types)) > 1 or any(connector in query_lower for connector in connectors)
 
+    async def _create_execution_plan(self, query: str, session_id: str) -> ExecutionPlan:
+        """Create a comprehensive execution plan for the query."""
+        logger.info(f"Creating execution plan for query: '{query[:100]}...'")
+        
+        # Get available agents
+        available_agents = self.agent_registry.get_all_agents()
+        agent_metadata = []
+        for agent in available_agents:
+            if agent.status == "active":
+                capabilities_str = ", ".join(agent.capabilities)
+                agent_metadata.append(
+                    f"Agent ID: {agent.agent_id}\n"
+                    f"Name: {agent.name}\n"
+                    f"Description: {agent.description}\n"
+                    f"Capabilities: {capabilities_str}\n"
+                    f"---\n"
+                )
+        
+        agents_info = "\n".join(agent_metadata)
+        
+        planning_prompt = f"""Create an execution plan for: "{query}"
+
+Available agents: {agents_info}
+
+Break this into 2-4 tasks max. Use parallel execution when possible.
+
+JSON format:
+{{
+    "plan_id": "plan_{session_id}",
+    "query": "{query}",
+    "nodes": {{
+        "node_1": {{
+            "node_id": "node_1",
+            "task_type": "research|code|creative|analysis|synthesis|direct_llm",
+            "description": "Brief task description",
+            "agent_id": "agent_id_or_null",
+            "input_data": {{"query": "task-specific query"}},
+            "dependencies": []
+        }}
+    }},
+    "execution_order": [
+        ["node_1", "node_2"],
+        ["node_3"]
+    ]
+}}
+
+Rules:
+- Max 4 nodes total
+- Use parallel execution for independent tasks
+- Always end with synthesis node
+- Keep descriptions brief
+
+JSON only:"""
+
+        try:
+            messages = [HumanMessage(content=planning_prompt)]
+            # Add timeout to prevent hanging
+            response = await asyncio.wait_for(
+                self._call_llm_with_rate_limit(messages, "planning"),
+                timeout=30.0  # 30 second timeout
+            )
+            
+            # Parse the JSON response
+            plan_data = json.loads(response.content)
+            
+            # Create ExecutionPlan object with timestamp if not provided
+            plan_id = plan_data.get("plan_id", f"plan_{session_id}_{int(time.time())}")
+            plan = ExecutionPlan(
+                plan_id=plan_id,
+                query=plan_data["query"],
+                execution_order=plan_data["execution_order"]
+            )
+            
+            # Create ExecutionNode objects
+            for node_id, node_data in plan_data["nodes"].items():
+                node = ExecutionNode(
+                    node_id=node_data["node_id"],
+                    task_type=TaskType(node_data["task_type"]),
+                    description=node_data["description"],
+                    agent_id=node_data.get("agent_id"),
+                    input_data=node_data.get("input_data", {}),
+                    dependencies=node_data.get("dependencies", [])
+                )
+                plan.nodes[node_id] = node
+            
+            plan.total_nodes = len(plan.nodes)
+            
+            logger.info(f"Created execution plan with {plan.total_nodes} nodes and {len(plan.execution_order)} execution batches")
+            return plan
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse planning response: {e}")
+            # Fallback to simple plan
+            return await self._create_fallback_plan(query, session_id)
+        except Exception as e:
+            logger.error(f"Planning failed: {e}")
+            return await self._create_fallback_plan(query, session_id)
+
+    async def _create_fallback_plan(self, query: str, session_id: str) -> ExecutionPlan:
+        """Create a fast fallback plan when planning fails."""
+        logger.info("Creating fast fallback execution plan")
+        
+        # Fast heuristic-based planning - only for truly multi-part queries
+        query_lower = query.lower()
+        
+        # Quick detection of task types
+        has_research = any(keyword in query_lower for keyword in ["research", "analyze", "study", "investigate", "origins", "history"])
+        has_code = any(keyword in query_lower for keyword in ["write", "code", "function", "program", "python", "javascript"])
+        has_creative = any(keyword in query_lower for keyword in ["creative", "story", "poem", "write a"])
+        
+        # Only create plan if we have multiple distinct task types
+        task_count = sum([has_research, has_code, has_creative])
+        if task_count < 2:
+            # Not truly multi-part, let traditional ReAct handle it
+            raise Exception("Not a true multi-part query, using traditional ReAct")
+        
+        nodes = {}
+        execution_order = []
+        node_counter = 1
+        
+        # Create nodes for detected task types
+        if has_research:
+            node_id = f"node_{node_counter}"
+            nodes[node_id] = ExecutionNode(
+                node_id=node_id,
+                task_type=TaskType.RESEARCH,
+                description="Research task",
+                agent_id="research",
+                input_data={"query": query},
+                dependencies=[]
+            )
+            node_counter += 1
+        
+        if has_code:
+            node_id = f"node_{node_counter}"
+            nodes[node_id] = ExecutionNode(
+                node_id=node_id,
+                task_type=TaskType.CODE,
+                description="Code task",
+                agent_id="code",
+                input_data={"query": query},
+                dependencies=[]
+            )
+            node_counter += 1
+        
+        if has_creative:
+            node_id = f"node_{node_counter}"
+            nodes[node_id] = ExecutionNode(
+                node_id=node_id,
+                task_type=TaskType.CREATIVE,
+                description="Creative task",
+                agent_id="creative",
+                input_data={"query": query},
+                dependencies=[]
+            )
+            node_counter += 1
+        
+        # Add synthesis node
+        synthesis_node_id = f"node_{node_counter}"
+        nodes[synthesis_node_id] = ExecutionNode(
+            node_id=synthesis_node_id,
+            task_type=TaskType.SYNTHESIS,
+            description="Synthesize results",
+            agent_id=None,
+            input_data={"query": query},
+            dependencies=list(nodes.keys())[:-1]
+        )
+        
+        # Create execution order - parallel for all task nodes, then synthesis
+        task_nodes = list(nodes.keys())[:-1]
+        execution_order.append(task_nodes)  # Parallel execution
+        execution_order.append([synthesis_node_id])  # Synthesis last
+        
+        plan = ExecutionPlan(
+            plan_id=f"fallback_plan_{session_id}_{int(time.time())}",
+            query=query,
+            nodes=nodes,
+            execution_order=execution_order,
+            total_nodes=len(nodes)
+        )
+        
+        logger.info(f"Created fast fallback plan with {plan.total_nodes} nodes")
+        return plan
+
+    async def _execute_node(self, node: ExecutionNode, session_id: str) -> str:
+        """Execute a single node in the execution plan."""
+        logger.info(f"Executing node {node.node_id}: {node.description}")
+        node.status = TaskStatus.RUNNING
+        node.started_at = datetime.now()
+        start_time = time.time()
+        
+        try:
+            if node.task_type == TaskType.DIRECT_LLM:
+                # Handle direct LLM tasks
+                result = await self._execute_direct_llm_task(node, session_id)
+            elif node.task_type == TaskType.SYNTHESIS:
+                # Handle synthesis tasks - need to pass the plan
+                # This will be handled in the _execute_plan method
+                result = "Synthesis task - handled separately"
+            else:
+                # Handle agent tasks
+                result = await self._execute_agent_task(node, session_id)
+            
+            node.result = result
+            node.status = TaskStatus.COMPLETED
+            node.completed_at = datetime.now()
+            node.execution_time = time.time() - start_time
+            
+            logger.info(f"Node {node.node_id} completed in {node.execution_time:.2f}s")
+            return result
+            
+        except Exception as e:
+            node.error = str(e)
+            node.status = TaskStatus.FAILED
+            node.completed_at = datetime.now()
+            node.execution_time = time.time() - start_time
+            
+            logger.error(f"Node {node.node_id} failed: {e}")
+            return f"Error executing {node.description}: {str(e)}"
+
+    async def _execute_direct_llm_task(self, node: ExecutionNode, session_id: str) -> str:
+        """Execute a direct LLM task."""
+        prompt = f"""
+Please provide a comprehensive response to the following task: {node.description}
+
+Query: {node.input_data.get('query', '')}
+
+Provide a clear, well-formatted response that directly addresses the task requirements.
+"""
+        messages = [HumanMessage(content=prompt)]
+        response = await self._call_llm_with_rate_limit(messages, "direct_task")
+        return response.content
+
+    async def _execute_agent_task(self, node: ExecutionNode, session_id: str) -> str:
+        """Execute a task using a specialized agent."""
+        if not node.agent_id:
+            raise ValueError(f"No agent specified for node {node.node_id}")
+        
+        try:
+            result = await self.agent_registry.call_agent(
+                node.agent_id, 
+                node.input_data, 
+                session_id
+            )
+            return result.get('response', str(result))
+        except Exception as e:
+            raise Exception(f"Agent {node.agent_id} failed: {str(e)}")
+
+    async def _execute_synthesis_task(self, node: ExecutionNode, plan: ExecutionPlan, session_id: str) -> str:
+        """Execute a synthesis task to combine results from multiple nodes."""
+        # Get results from dependency nodes
+        dependency_results = []
+        for dep_id in node.dependencies:
+            dep_node = plan.nodes[dep_id]
+            if dep_node.result:
+                dependency_results.append(f"Result from {dep_id}: {dep_node.result}")
+        
+        if not dependency_results:
+            return "No results to synthesize"
+        
+        synthesis_prompt = f"""
+Based on the following results from different tasks, provide a comprehensive final answer to the user's query: "{node.input_data.get('query', '')}"
+
+Task Results:
+{chr(10).join(dependency_results)}
+
+Please synthesize these results into a coherent, well-structured response that:
+1. Addresses all aspects of the original query
+2. Combines information from different sources seamlessly
+3. Provides a comprehensive and useful answer
+4. Maintains logical flow and context
+"""
+        messages = [HumanMessage(content=synthesis_prompt)]
+        response = await self._call_llm_with_rate_limit(messages, "synthesis")
+        return response.content
+
+    async def _execute_plan(self, plan: ExecutionPlan, session_id: str) -> str:
+        """Execute the entire execution plan with parallel processing."""
+        logger.info(f"Executing plan {plan.plan_id} with {plan.total_nodes} nodes")
+        plan.started_at = datetime.now()
+        
+        try:
+            # Execute each batch in the execution order
+            for batch_index, batch in enumerate(plan.execution_order):
+                logger.info(f"Executing batch {batch_index + 1}/{len(plan.execution_order)}: {batch}")
+                
+                # Create tasks for parallel execution
+                tasks = []
+                for node_id in batch:
+                    node = plan.nodes[node_id]
+                    # Check if dependencies are satisfied
+                    if all(plan.nodes[dep_id].status == TaskStatus.COMPLETED for dep_id in node.dependencies):
+                        if node.task_type == TaskType.SYNTHESIS:
+                            # Handle synthesis tasks specially
+                            task = asyncio.create_task(self._execute_synthesis_task(node, plan, session_id))
+                        else:
+                            task = asyncio.create_task(self._execute_node(node, session_id))
+                        tasks.append((node_id, task))
+                    else:
+                        logger.warning(f"Skipping node {node_id} - dependencies not satisfied")
+                        node.status = TaskStatus.SKIPPED
+                
+                # Execute tasks in parallel
+                if tasks:
+                    results = await asyncio.gather(*[task for _, task in tasks], return_exceptions=True)
+                    
+                    # Process results
+                    for (node_id, _), result in zip(tasks, results):
+                        node = plan.nodes[node_id]
+                        if isinstance(result, Exception):
+                            node.error = str(result)
+                            node.status = TaskStatus.FAILED
+                            plan.failed_nodes += 1
+                        else:
+                            plan.completed_nodes += 1
+                
+                # Check if we should continue
+                if plan.failed_nodes > 0 and plan.failed_nodes >= plan.total_nodes // 2:
+                    logger.warning("Too many failed nodes, stopping execution")
+                    break
+            
+            # Get final result from synthesis node or last completed node
+            final_result = await self._get_final_result(plan)
+            
+            plan.completed_at = datetime.now()
+            logger.info(f"Plan execution completed. Success: {plan.completed_nodes}/{plan.total_nodes}")
+            
+            return final_result
+            
+        except Exception as e:
+            logger.error(f"Plan execution failed: {e}")
+            return f"Execution failed: {str(e)}"
+
+    async def _get_final_result(self, plan: ExecutionPlan) -> str:
+        """Get the final result from the execution plan."""
+        # Look for synthesis node first
+        synthesis_nodes = [node for node in plan.nodes.values() if node.task_type == TaskType.SYNTHESIS]
+        if synthesis_nodes and synthesis_nodes[0].status == TaskStatus.COMPLETED:
+            return synthesis_nodes[0].result
+        
+        # Otherwise, combine results from all completed nodes
+        completed_results = []
+        for node in plan.nodes.values():
+            if node.status == TaskStatus.COMPLETED and node.result:
+                completed_results.append(f"{node.description}: {node.result}")
+        
+        if completed_results:
+            if len(completed_results) == 1:
+                return completed_results[0]
+            else:
+                # Combine multiple results
+                combined_prompt = f"""
+Based on the following results, provide a comprehensive final answer:
+
+Results:
+{chr(10).join(completed_results)}
+
+Please combine these into a coherent response.
+"""
+                messages = [HumanMessage(content=combined_prompt)]
+                response = await self._call_llm_with_rate_limit(messages, "final_synthesis")
+                return response.content
+        
+        return "No results available from execution plan"
+
     async def _handle_simple_query(self, request: TaskRequest, start_time: float) -> TaskResponse:
         """Handle simple queries with direct LLM response."""
         session_id = request.session_id
@@ -333,7 +701,7 @@ Remember: Your selection should be based on intelligent analysis of the query's 
             return "general"
     
     async def execute_task(self, request: TaskRequest) -> TaskResponse:
-        """Execute a task using the ReAct paradigm."""
+        """Execute a task using the enhanced planning and execution system."""
         session_id = request.session_id
         query = request.query
         max_iterations = request.max_iterations or self.config.supervisor.max_iterations
@@ -347,17 +715,51 @@ Remember: Your selection should be based on intelligent analysis of the query's 
             return await self._handle_simple_query(request, start_time)
         
         # Initialize supervisor state
+        # Check if planning is enabled (can be disabled for maximum speed)
+        use_planning = getattr(self.config.supervisor, 'use_planning', True)
         state = SupervisorState(
             session_id=session_id,
             query=query,
             max_iterations=max_iterations,
-            context=request.context or {}
+            context=request.context or {},
+            use_planning=use_planning
         )
         
         # Get conversation context
         conversation_context = self.memory_manager.get_conversation_context(session_id)
         
         try:
+            # Use the new planning system only for truly complex multi-part queries
+            if state.use_planning and self._is_multi_part_query(query) and len(query.split()) > 15:
+                logger.info("Using enhanced planning system for complex multi-part query")
+                
+                # Try LLM planning first, but fallback quickly if it fails
+                try:
+                    execution_plan = await self._create_execution_plan(query, session_id)
+                    state.execution_plan = execution_plan
+                    
+                    # Execute the plan
+                    final_response = await self._execute_plan(execution_plan, session_id)
+                    state.final_response = final_response
+                    state.is_complete = True
+                except Exception as e:
+                    logger.warning(f"Planning system failed, falling back to traditional ReAct: {e}")
+                    # Fall through to traditional ReAct system
+                    state.use_planning = False
+                else:
+                    # Record planning steps only if planning succeeded
+                    planning_step = ReasoningStep(
+                        step=1,
+                        reasoning=f"Created execution plan with {execution_plan.total_nodes} nodes",
+                        action="planning",
+                        observation=f"Plan executed successfully: {execution_plan.completed_nodes}/{execution_plan.total_nodes} nodes completed"
+                    )
+                    state.reasoning_steps.append(planning_step)
+                
+            else:
+                # Use the old ReAct system for simpler queries
+                logger.info("Using traditional ReAct system for simple query")
+                
             # ReAct loop with early termination optimization
             while state.current_iteration < state.max_iterations and not state.is_complete:
                 state.current_iteration += 1
@@ -373,14 +775,14 @@ Remember: Your selection should be based on intelligent analysis of the query's 
                         state.is_complete = True
                         break
                     else:
-                        logger.warning("Reasoning marked as final but provided no final_response, continuing...")
+                            logger.warning("Reasoning marked as final but provided no final_response, continuing...")
                 
-                # Early termination check for synthesis
+                    # Early termination check for synthesis
                 if (len(state.agent_calls) >= 1 and 
                     reasoning_result.get("action") == "synthesize_response"):
-                    logger.info(f"Early termination: Agent response available, proceeding with synthesis")
-                    state.is_complete = True
-                    break
+                        logger.info(f"Early termination: Agent response available, proceeding with synthesis")
+                        state.is_complete = True
+                        break
                 
                 # Execute the action
                 observation = await self._execute_action(reasoning_result, state)
@@ -439,7 +841,13 @@ Remember: Your selection should be based on intelligent analysis of the query's 
                     "iterations": state.current_iteration,
                     "agents_used": list(set([call.agent_id for call in state.agent_calls])),
                     "success": True,
-                    "final_response_length": len(state.final_response) if state.final_response else 0
+                    "final_response_length": len(state.final_response) if state.final_response else 0,
+                    "execution_plan": {
+                        "plan_id": state.execution_plan.plan_id if state.execution_plan else None,
+                        "total_nodes": state.execution_plan.total_nodes if state.execution_plan else 0,
+                        "completed_nodes": state.execution_plan.completed_nodes if state.execution_plan else 0,
+                        "failed_nodes": state.execution_plan.failed_nodes if state.execution_plan else 0
+                    } if state.execution_plan else None
                 }
             }
             
@@ -449,6 +857,13 @@ Remember: Your selection should be based on intelligent analysis of the query's 
             
             total_duration = time.time() - start_time
             logger.info(f"Task execution completed for session {session_id} in {total_duration:.2f}s with {state.current_iteration} iterations")
+            
+            # Collect agents used from both traditional calls and execution plan
+            agents_used = list(set([call.agent_id for call in state.agent_calls]))
+            if state.execution_plan:
+                plan_agents = [node.agent_id for node in state.execution_plan.nodes.values() if node.agent_id]
+                agents_used.extend(plan_agents)
+                agents_used = list(set(agents_used))
             
             return TaskResponse(
                 session_id=session_id,
@@ -463,7 +878,7 @@ Remember: Your selection should be based on intelligent analysis of the query's 
                     }
                     for step in state.reasoning_steps
                 ],
-                agents_used=list(set([call.agent_id for call in state.agent_calls])),
+                agents_used=agents_used,
                 iterations=state.current_iteration,
                 success=True
             )

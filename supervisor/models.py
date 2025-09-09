@@ -1,8 +1,9 @@
 """Pydantic models for the supervisor."""
 
-from typing import Dict, List, Any, Optional, Literal
+from typing import Dict, List, Any, Optional, Literal, Set
 from pydantic import BaseModel, Field
 from datetime import datetime
+from enum import Enum
 
 
 class AgentInfo(BaseModel):
@@ -53,6 +54,56 @@ class ReasoningStep(BaseModel):
     timestamp: datetime = Field(default_factory=datetime.now)
 
 
+class TaskType(str, Enum):
+    """Types of tasks that can be executed."""
+    RESEARCH = "research"
+    CODE = "code"
+    CREATIVE = "creative"
+    ANALYSIS = "analysis"
+    SYNTHESIS = "synthesis"
+    DIRECT_LLM = "direct_llm"
+
+
+class TaskStatus(str, Enum):
+    """Status of a task in the execution graph."""
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class ExecutionNode(BaseModel):
+    """A node in the execution graph representing a task."""
+    node_id: str
+    task_type: TaskType
+    description: str
+    agent_id: Optional[str] = None  # None for direct LLM tasks
+    input_data: Dict[str, Any] = Field(default_factory=dict)
+    dependencies: List[str] = Field(default_factory=list)  # Node IDs this depends on
+    status: TaskStatus = TaskStatus.PENDING
+    result: Optional[str] = None
+    error: Optional[str] = None
+    execution_time: Optional[float] = None
+    created_at: datetime = Field(default_factory=datetime.now)
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+
+class ExecutionPlan(BaseModel):
+    """A complete execution plan with nodes and dependencies."""
+    plan_id: str
+    query: str
+    nodes: Dict[str, ExecutionNode] = Field(default_factory=dict)
+    execution_order: List[List[str]] = Field(default_factory=list)  # Parallel execution batches
+    total_nodes: int = 0
+    completed_nodes: int = 0
+    failed_nodes: int = 0
+    created_at: datetime = Field(default_factory=datetime.now)
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+
 class SupervisorState(BaseModel):
     """State of the supervisor during task execution."""
     session_id: str
@@ -65,3 +116,6 @@ class SupervisorState(BaseModel):
     final_response: Optional[str] = None
     is_complete: bool = False
     error: Optional[str] = None
+    # New fields for planning system
+    execution_plan: Optional[ExecutionPlan] = None
+    use_planning: bool = True
