@@ -1,0 +1,71 @@
+# Multi-Agent Supervisor Configuration
+supervisor:
+  name: "Supervisor"
+  host: "localhost"
+  port: 8000
+  llm_provider: "google"
+  model: "gemini-2.0-flash-lite"
+  max_iterations: 3
+  memory_backend: "in_memory_sqlite"  # in_memory_sqlite, in_memory_dict, sqlite, redis
+  rate_limiting:
+    min_llm_call_interval: 1.0  # Minimum seconds between LLM calls
+    max_requests_per_minute: 30  # Maximum requests per minute to LLM
+
+# LLM Provider Configurations
+llm_providers:
+  groq:
+    api_key_env: "GROQ_API_KEY"
+    base_url: "https://api.groq.com/openai/v1"
+    default_model: "llama-3.1-8b-instant"
+    available_models:
+      - "llama-3.1-8b-instant"
+      - "llama3-70b-8192"
+      - "mixtral-8x7b-32768"
+  
+  openai:
+    api_key_env: "OPENAI_API_KEY"
+    base_url: "https://api.openai.com/v1"
+    default_model: "gpt-4"
+    available_models:
+      - "gpt-4"
+      - "gpt-4-turbo"
+      - "gpt-3.5-turbo"
+  
+  google:
+    api_key_env: "GOOGLE_API_KEY"
+    default_model: "gemini-2.0-flash-lite"
+    available_models:
+      - "gemini-2.0-flash"
+      - "gemini-2.0-flash-lite"
+      # - "gemini-pro-vision"
+
+# Memory Configuration
+memory:
+  # In-memory backends (default)
+  in_memory_sqlite:
+    # No configuration needed - uses SQLite in-memory mode
+  
+  in_memory_dict:
+    # No configuration needed - uses Python dictionaries
+  
+  # Persistent backends (optional)
+  sqlite:
+    database_url: "sqlite:///./agent_memory.db"
+  
+  redis:
+    host: "localhost"
+    port: 6379
+    db: 0
+    password: null
+
+# Agent Registry
+agent_registry:
+  discovery_port: 8001
+  health_check_interval: 30
+  max_retries: 3
+
+# Logging
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/agent_orchestrator.log"
