@@ -14,6 +14,8 @@ class AgentInfo(BaseModel):
     capabilities: List[str]
     endpoint: str
     status: Literal["active", "inactive", "error"] = "active"
+    health_check: Optional[str] = None
+    registration_time: Optional[datetime] = None
     registered_at: datetime = Field(default_factory=datetime.now)
     last_health_check: Optional[datetime] = None
 
@@ -42,6 +44,7 @@ class AgentCall(BaseModel):
     """Individual agent call within a task."""
     agent_id: str
     input_data: Dict[str, Any]
+    response: Optional[str] = None
     timestamp: datetime = Field(default_factory=datetime.now)
 
 
